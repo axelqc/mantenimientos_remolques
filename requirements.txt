@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+ibm_db
+pydantic
+pandas
+openpyxl
+python-dotenv
