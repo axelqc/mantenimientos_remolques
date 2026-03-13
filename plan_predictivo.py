@@ -107,7 +107,10 @@ def generar_plan_equipo(
 ):
     conn = get_db2_connection()
     try:
-        stmt = ibm_db.prepare(conn, f"CALL {SCHEMA}.SP_GENERAR_PLAN_EQUIPO(?, ?)")
+        stmt = ibm_db.prepare(
+            conn,
+            f"CALL {SCHEMA}.SP_GENERAR_PLAN_EQUIPO(?, CAST(? AS INTEGER))"
+        )
         ibm_db.execute(stmt, (numero_serie, meses))
         ibm_db.commit(conn)
 
@@ -131,6 +134,7 @@ def generar_plan_equipo(
             "ultimo_servicio": str(row["ULTIMA"]) if row and row["ULTIMA"] else None,
         }
     except Exception as e:
+        ibm_db.rollback(conn)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         ibm_db.close(conn)
@@ -152,7 +156,10 @@ def generar_plan_flota(
 ):
     conn = get_db2_connection()
     try:
-        stmt = ibm_db.prepare(conn, f"CALL {SCHEMA}.SP_GENERAR_PLAN_FLOTA(?)")
+        stmt = ibm_db.prepare(
+            conn,
+            f"CALL {SCHEMA}.SP_GENERAR_PLAN_FLOTA(CAST(? AS INTEGER))"
+        )
         ibm_db.execute(stmt, (meses,))
         ibm_db.commit(conn)
 
@@ -177,10 +184,10 @@ def generar_plan_flota(
             "resumen_por_nivel": resumen,
         }
     except Exception as e:
+        ibm_db.rollback(conn)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         ibm_db.close(conn)
-
 
 # ----------------------------------------------------------
 # 3. VER PLAN DE UN EQUIPO
