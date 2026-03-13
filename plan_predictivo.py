@@ -134,7 +134,7 @@ def generar_plan_equipo(
         ibm_db.rollback(conn)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        ibm_db.close(conn
+        ibm_db.close(conn)
 
 
 # ----------------------------------------------------------
