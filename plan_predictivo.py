@@ -9,8 +9,8 @@ Montado como router en main.py:
 import ibm_db
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query
-from pydantic import BaseModel
-
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_upper   # Pydantic v2
 from db import get_db2_connection, execute_query, SCHEMA
 
 router = APIRouter()
@@ -45,16 +45,21 @@ class PlanServicio(BaseModel):
 
 
 class AgendaItem(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=lambda field: field.upper(),  # acepta MAYÚSCULAS del DB
+        populate_by_name=True,                        # también acepta minúsculas
+    )
+
     fecha_programada: str
     prioridad: int
-    nivel_riesgo: Optional[str]
-    risk_score: Optional[float]
+    nivel_riesgo: str
+    risk_score: str
     numero_serie: str
-    numero_economico: Optional[str]
-    modelo: Optional[str]
-    cliente: Optional[str]
-    tipo_mantenimiento: Optional[str]
-    horometro_estimado: Optional[float]
+    numero_economico: str
+    modelo: str
+    cliente: str
+    tipo_mantenimiento: str
+    horometro_estimado: str
     alcance: Optional[str]
     checklist: Optional[str]
     categoria_dominante: Optional[str]
