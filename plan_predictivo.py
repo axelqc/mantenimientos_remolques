@@ -10,7 +10,6 @@ import ibm_db
 from typing import Optional, List
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_upper   # Pydantic v2
 from db import get_db2_connection, execute_query, SCHEMA
 
 router = APIRouter()
