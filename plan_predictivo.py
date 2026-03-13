@@ -140,23 +140,161 @@ def generar_plan_equipo(
 # ----------------------------------------------------------
 # 2. GENERAR PLAN PARA TODA LA FLOTA
 # ----------------------------------------------------------
+from datetime import date, timedelta
+from fastapi import APIRouter, Query, HTTPException
+import ibm_db
+
+router = APIRouter()
+
+CHECKLIST_POR_CATEGORIA = {
+    'Eléctrico / Electrónico':    '|EXTRA: Termografía eléctrica|Revisar arnés completo|Prueba alternador',
+    'Enfriamiento':               '|EXTRA: Inspección radiador|Test termostato|Verificar coolant|Mangueras enfriamiento',
+    'Hidráulico':                 '|EXTRA: Análisis aceite hidráulico|Mangueras HP|Bomba hidráulica|Sellos cilindros',
+    'Arranque / Batería':         '|EXTRA: Prueba carga batería|Test marcha|Conexiones|Bornes',
+    'Mástil / Elevación':         '|EXTRA: Cadenas mástil|Rodillos|Cilindros elevación|Aceite mástil',
+    'Dirección':                  '|EXTRA: Cilindro dirección|Articulaciones|Aceite dirección|Holguras',
+    'Frenos':                     '|EXTRA: Pastillas/zapatas|Prueba frenado|Discos|Líquido frenos',
+    'Escape / Mofle':             '|EXTRA: Inspección escape|Mofle|Manifold|Juntas',
+    'Diagnóstico / Habilitación': '|EXTRA: Diagnóstico completo sistemas|Verificar códigos falla',
+}
+
+
+def _fetch_all(stmt) -> list:
+    """Convierte un resultado ibm_db en lista de dicts."""
+    rows = []
+    row = ibm_db.fetch_assoc(stmt)
+    while row:
+        rows.append(dict(row))
+        row = ibm_db.fetch_assoc(stmt)
+    return rows
+
+
+def _cargar_politicas(conn) -> dict:
+    """Políticas agrupadas por NIVEL_RIESGO."""
+    stmt = ibm_db.exec_immediate(
+        conn,
+        f"SELECT * FROM {SCHEMA}.POLITICA_MANTENIMIENTO WHERE ACTIVO = 1"
+    )
+    pol_by_nivel = {}
+    for p in _fetch_all(stmt):
+        pol_by_nivel.setdefault(p['NIVEL_RIESGO'], []).append(p)
+    return pol_by_nivel
+
+
+def _cargar_equipos(conn, numero_serie: str = None) -> list:
+    """
+    Lee RISK_SCORE (ya tiene todo lo que necesita el motor de plan).
+    Filtra por equipo si se pasa numero_serie.
+    """
+    filtro = ""
+    if numero_serie:
+        serie_safe = numero_serie.replace("'", "''")
+        filtro = f"WHERE NUMERO_SERIE = '{serie_safe}'"
+
+    sql = f"""
+        SELECT
+            NUMERO_SERIE      AS SERIE,
+            NIVEL_RIESGO      AS NIVEL,
+            RISK_SCORE        AS RISK_SCORE,
+            ULTIMO_HOROMETRO  AS ULTIMO_HORO,
+            PROMEDIO_USO_DIA  AS AVG_USO,
+            CATEGORIA_DOMINANTE AS CAT_DOMINANTE
+        FROM {SCHEMA}.RISK_SCORE
+        {filtro}
+    """
+    stmt = ibm_db.exec_immediate(conn, sql)
+    return _fetch_all(stmt)
+
+
+def _generar_plan(conn, equipos: list, pol_by_nivel: dict, meses: int) -> int:
+    """Núcleo compartido. Inserta en PLAN_MANTENIMIENTO y devuelve total insertado."""
+    fecha_hoy    = date.today()
+    fecha_limite = fecha_hoy + timedelta(days=meses * 30)
+
+    sql_insert = f"""
+        INSERT INTO {SCHEMA}.PLAN_MANTENIMIENTO
+        (NUMERO_SERIE, NIVEL_RIESGO_ASIGNADO, RISK_SCORE_AL_GENERAR,
+         TIPO_MANTENIMIENTO, FECHA_PROGRAMADA, HOROMETRO_ESTIMADO,
+         ALCANCE, CHECKLIST, PRIORIDAD, ESTADO)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDIENTE')
+    """
+    stmt_insert = ibm_db.prepare(conn, sql_insert)
+
+    total = 0
+
+    for eq in equipos:
+        serie = eq['SERIE']
+        nivel = str(eq['NIVEL'])
+        risk  = float(eq['RISK_SCORE'] or 0)
+        horo  = float(eq['ULTIMO_HORO'] or 0)
+        uso   = float(eq['AVG_USO']) if eq['AVG_USO'] and float(eq['AVG_USO']) > 0 else 4.0
+        cat   = str(eq['CAT_DOMINANTE']) if eq['CAT_DOMINANTE'] else None
+
+        pols = pol_by_nivel.get(nivel, pol_by_nivel.get('BAJO', []))
+
+        for pol in pols:
+            int_horas    = pol['INTERVALO_HORAS']
+            int_dias_max = pol['INTERVALO_DIAS_MAX']
+            alcance      = pol['ALCANCE'] or ''
+            checklist    = pol['CHECKLIST_EXTRA'] or ''
+
+            if cat and cat != 'None':
+                alcance   += f' + FOCO EN: {cat}'
+                checklist += CHECKLIST_POR_CATEGORIA.get(cat, '')
+
+            dias_por_uso   = int(int_horas / uso) if uso > 0 else int_dias_max
+            dias_intervalo = max(min(dias_por_uso, int_dias_max), 3)
+
+            fecha_next = fecha_hoy + timedelta(days=dias_intervalo)
+            while fecha_next <= fecha_limite:
+                horo_est = horo + (fecha_next - fecha_hoy).days * uso
+                try:
+                    ibm_db.execute(stmt_insert, (
+                        serie, nivel, risk,
+                        pol['TIPO_MANTENIMIENTO'],
+                        fecha_next.strftime('%Y-%m-%d'),
+                        round(horo_est, 1),
+                        alcance[:1000],
+                        checklist[:1000],
+                        pol['PRIORIDAD'],
+                    ))
+                    total += 1
+                except Exception:
+                    pass
+                fecha_next += timedelta(days=dias_intervalo)
+
+    ibm_db.commit(conn)
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 1 — Toda la flota
+# ─────────────────────────────────────────────────────────────────────────────
 @router.post(
     "/plan/generar-flota",
     summary="Generar plan predictivo para toda la flota",
     description="Genera planes de mantenimiento para TODOS los equipos activos. "
-                "Cada equipo obtiene su propio plan según su nivel de riesgo. "
-                "Los equipos BAJO riesgo tendrán menos servicios programados que los CRITICO.",
-    tags=["Plan Predictivo"], )
+                "Cada equipo obtiene su propio plan según su nivel de riesgo.",
+    tags=["Plan Predictivo"],
+)
 def generar_plan_flota(
     meses: int = Query(6, ge=1, le=12, description="Horizonte de planificación en meses"),
 ):
     conn = get_db2_connection()
     try:
-        # Sin binding — valor entero directo en el SQL, sin riesgo de inyección
-        # porque meses ya está validado por FastAPI (ge=1, le=12, tipo int)
-        sql = f"CALL {SCHEMA}.SP_GENERAR_PLAN_FLOTA({int(meses)})"
-        ibm_db.exec_immediate(conn, sql)
+        ibm_db.exec_immediate(
+            conn,
+            f"DELETE FROM {SCHEMA}.PLAN_MANTENIMIENTO WHERE ESTADO = 'PENDIENTE'"
+        )
         ibm_db.commit(conn)
+
+        pol_by_nivel = _cargar_politicas(conn)
+        equipos      = _cargar_equipos(conn)
+
+        if not equipos:
+            raise HTTPException(status_code=404, detail="No hay equipos con risk score calculado")
+
+        total = _generar_plan(conn, equipos, pol_by_nivel, meses)
 
         resumen = execute_query(f"""
             SELECT NIVEL_RIESGO_ASIGNADO, COUNT(*) AS SERVICIOS,
@@ -167,8 +305,8 @@ def generar_plan_flota(
             ORDER BY
                 CASE NIVEL_RIESGO_ASIGNADO
                     WHEN 'CRITICO' THEN 1
-                    WHEN 'ALTO' THEN 2
-                    WHEN 'MEDIO' THEN 3
+                    WHEN 'ALTO'    THEN 2
+                    WHEN 'MEDIO'   THEN 3
                     ELSE 4
                 END
         """)
@@ -176,47 +314,78 @@ def generar_plan_flota(
         return {
             "status": "ok",
             "meses_planificados": meses,
+            "equipos_planificados": len(equipos),
+            "total_servicios": total,
             "resumen_por_nivel": resumen,
         }
+    except HTTPException:
+        raise
     except Exception as e:
         ibm_db.rollback(conn)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         ibm_db.close(conn)
 
-# ----------------------------------------------------------
-# 3. VER PLAN DE UN EQUIPO
-# ----------------------------------------------------------
-@router.get(
-    "/plan/{numero_serie}",
-    response_model=List[PlanServicio],
-    summary="Ver plan de mantenimiento de un equipo",
-    description="Retorna todos los servicios programados del equipo, con fechas, "
-                "horómetro estimado, alcance y checklist personalizado según su riesgo.",
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENDPOINT 2 — Un solo equipo
+# ─────────────────────────────────────────────────────────────────────────────
+@router.post(
+    "/plan/generar/{numero_serie}",
+    summary="Generar plan predictivo para un equipo",
+    description="Genera el plan de mantenimiento basado en el nivel de riesgo del equipo.",
     tags=["Plan Predictivo"],
 )
-def get_plan_equipo(
+def generar_plan_equipo(
     numero_serie: str,
-    estado: Optional[str] = Query(None, description="Filtrar: PENDIENTE, EJECUTADO, CANCELADO"),
+    meses: int = Query(6, ge=1, le=12, description="Horizonte de planificación en meses"),
 ):
-    where = "WHERE pm.NUMERO_SERIE = ?"
-    params = [numero_serie]
-    if estado:
-        where += " AND pm.ESTADO = ?"
-        params.append(estado.upper())
+    conn = get_db2_connection()
+    try:
+        equipos = _cargar_equipos(conn, numero_serie=numero_serie)
+        if not equipos:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Equipo '{numero_serie}' no encontrado en RISK_SCORE"
+            )
 
-    sql = f"""
-        SELECT pm.* FROM {SCHEMA}.PLAN_MANTENIMIENTO pm
-        {where}
-        ORDER BY pm.FECHA_PROGRAMADA
-    """
-    results = execute_query(sql, tuple(params))
-    if not results:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No hay plan para {numero_serie}. Genéralo primero con POST /plan/generar/{numero_serie}"
+        serie_safe = numero_serie.replace("'", "''")
+        ibm_db.exec_immediate(
+            conn,
+            f"DELETE FROM {SCHEMA}.PLAN_MANTENIMIENTO "
+            f"WHERE NUMERO_SERIE = '{serie_safe}' AND ESTADO = 'PENDIENTE'"
         )
-    return results
+        ibm_db.commit(conn)
+
+        pol_by_nivel = _cargar_politicas(conn)
+        total        = _generar_plan(conn, equipos, pol_by_nivel, meses)
+
+        stmt = ibm_db.exec_immediate(conn, f"""
+            SELECT COUNT(*) AS TOTAL,
+                   MIN(FECHA_PROGRAMADA) AS PRIMERA,
+                   MAX(FECHA_PROGRAMADA) AS ULTIMA
+            FROM {SCHEMA}.PLAN_MANTENIMIENTO
+            WHERE NUMERO_SERIE = '{serie_safe}' AND ESTADO = 'PENDIENTE'
+        """)
+        row = ibm_db.fetch_assoc(stmt)
+
+        return {
+            "status": "ok",
+            "numero_serie": numero_serie,
+            "nivel_riesgo": equipos[0]['NIVEL'],
+            "risk_score": float(equipos[0]['RISK_SCORE'] or 0),
+            "meses_planificados": meses,
+            "servicios_generados": int(row["TOTAL"]) if row else 0,
+            "primer_servicio": str(row["PRIMERA"]) if row and row["PRIMERA"] else None,
+            "ultimo_servicio":  str(row["ULTIMA"])  if row and row["ULTIMA"]  else None,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        ibm_db.rollback(conn)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        ibm_db.close(conn)
 
 
 # ----------------------------------------------------------
