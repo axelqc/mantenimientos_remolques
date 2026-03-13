@@ -107,11 +107,10 @@ def generar_plan_equipo(
 ):
     conn = get_db2_connection()
     try:
-        stmt = ibm_db.prepare(
-            conn,
-            f"CALL {SCHEMA}.SP_GENERAR_PLAN_EQUIPO(?, CAST(? AS INTEGER))"
-        )
-        ibm_db.execute(stmt, (numero_serie, meses))
+        # numero_serie se sanitiza manualmente para evitar inyección
+        serie_safe = numero_serie.replace("'", "''")
+        sql = f"CALL {SCHEMA}.SP_GENERAR_PLAN_EQUIPO('{serie_safe}', {int(meses)})"
+        ibm_db.exec_immediate(conn, sql)
         ibm_db.commit(conn)
 
         count_sql = f"""
@@ -119,11 +118,9 @@ def generar_plan_equipo(
                    MIN(FECHA_PROGRAMADA) AS PRIMERA,
                    MAX(FECHA_PROGRAMADA) AS ULTIMA
             FROM {SCHEMA}.PLAN_MANTENIMIENTO
-            WHERE NUMERO_SERIE = ? AND ESTADO = 'PENDIENTE'
+            WHERE NUMERO_SERIE = '{serie_safe}' AND ESTADO = 'PENDIENTE'
         """
-        stmt2 = ibm_db.prepare(conn, count_sql)
-        ibm_db.execute(stmt2, (numero_serie,))
-        row = ibm_db.fetch_assoc(stmt2)
+        row = ibm_db.fetch_assoc(ibm_db.exec_immediate(conn, count_sql))
 
         return {
             "status": "ok",
@@ -137,7 +134,7 @@ def generar_plan_equipo(
         ibm_db.rollback(conn)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        ibm_db.close(conn)
+        ibm_db.close(conn
 
 
 # ----------------------------------------------------------
@@ -149,18 +146,16 @@ def generar_plan_equipo(
     description="Genera planes de mantenimiento para TODOS los equipos activos. "
                 "Cada equipo obtiene su propio plan según su nivel de riesgo. "
                 "Los equipos BAJO riesgo tendrán menos servicios programados que los CRITICO.",
-    tags=["Plan Predictivo"],
-)
+    tags=["Plan Predictivo"], )
 def generar_plan_flota(
     meses: int = Query(6, ge=1, le=12, description="Horizonte de planificación en meses"),
 ):
     conn = get_db2_connection()
     try:
-        stmt = ibm_db.prepare(
-            conn,
-            f"CALL {SCHEMA}.SP_GENERAR_PLAN_FLOTA(CAST(? AS INTEGER))"
-        )
-        ibm_db.execute(stmt, (meses,))
+        # Sin binding — valor entero directo en el SQL, sin riesgo de inyección
+        # porque meses ya está validado por FastAPI (ge=1, le=12, tipo int)
+        sql = f"CALL {SCHEMA}.SP_GENERAR_PLAN_FLOTA({int(meses)})"
+        ibm_db.exec_immediate(conn, sql)
         ibm_db.commit(conn)
 
         resumen = execute_query(f"""
