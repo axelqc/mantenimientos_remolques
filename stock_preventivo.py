@@ -1,7 +1,7 @@
 """
 router: stock_preventivo.py
-Stock preventivo cruzando MEANFTB + CORRECTIVOS + NUMSPARTE.
-Usa execute_query / get_schema de db.py
+Stock preventivo cruzando MEANFTB + EQUIPOS + CORRECTIVOS + NUMSPARTE.
+MEANFTB.EQUIPO = NUMERO_ECONOMICO → JOIN EQUIPOS → NUMERO_SERIE → CORRECTIVOS
 """
 
 from fastapi import APIRouter, Query
@@ -29,6 +29,7 @@ def get_prioridad(categoria: str, riesgo: str) -> str:
     return base
 
 class EquipoEnRiesgo(BaseModel):
+    numero_economico: str
     numero_serie:     str
     mtbf_dias:        float
     riesgo:           str
@@ -60,15 +61,22 @@ def stock_preventivo(horizonte_dias: int = Query(default=30, ge=7, le=90)):
     hoy  = date.today()
     fecha_limite = (hoy + timedelta(days=horizonte_dias)).isoformat()
 
-    # 1. Equipos en riesgo desde MEANFTB (columnas ya renombradas)
+    # 1. Equipos en riesgo: JOIN MEANFTB → EQUIPOS para obtener NUMERO_SERIE
     equipos_rows = execute_query(f"""
-        SELECT EQUIPO, MTBF_DIAS, RIESGO,
-               FECHA_PROX_FALLA, CATEGORIA_PROBABLE, FALLA_PROBABLE
-        FROM {S}.MEANFTB
-        WHERE (RIESGO LIKE 'ALTO%' OR RIESGO LIKE 'MEDIO%')
-          AND FECHA_PROX_FALLA IS NOT NULL
-          AND FECHA_PROX_FALLA <= '{fecha_limite}'
-        ORDER BY FECHA_PROX_FALLA ASC
+        SELECT
+            m.EQUIPO            AS NUMERO_ECONOMICO,
+            e.NUMERO_SERIE      AS NUMERO_SERIE,
+            m.MTBF_DIAS,
+            m.RIESGO,
+            m.FECHA_PROX_FALLA,
+            m.CATEGORIA_PROBABLE,
+            m.FALLA_PROBABLE
+        FROM {S}.MEANFTB m
+        JOIN {S}.EQUIPOS e ON UPPER(TRIM(e.NUMERO_ECONOMICO)) = UPPER(TRIM(m.EQUIPO))
+        WHERE (m.RIESGO LIKE 'ALTO%' OR m.RIESGO LIKE 'MEDIO%')
+          AND m.FECHA_PROX_FALLA IS NOT NULL
+          AND m.FECHA_PROX_FALLA <= '{fecha_limite}'
+        ORDER BY m.FECHA_PROX_FALLA ASC
     """)
 
     if not equipos_rows:
@@ -89,9 +97,11 @@ def stock_preventivo(horizonte_dias: int = Query(default=30, ge=7, le=90)):
         dias_restantes = (date.fromisoformat(fecha_prox_str) - hoy).days if fecha_prox_str else 0
         riesgo_raw     = r.get("RIESGO") or ""
         riesgo_norm    = "ALTO" if riesgo_raw.upper().startswith("ALTO") else "MEDIO"
+        ns             = (r.get("NUMERO_SERIE") or "").strip().upper()
 
         equipos_en_riesgo.append(EquipoEnRiesgo(
-            numero_serie=r.get("EQUIPO") or "",
+            numero_economico=r.get("NUMERO_ECONOMICO") or "",
+            numero_serie=ns,
             mtbf_dias=float(r.get("MTBF_DIAS") or 0),
             riesgo=riesgo_norm,
             fecha_prox_falla=fecha_prox_str,
@@ -99,20 +109,30 @@ def stock_preventivo(horizonte_dias: int = Query(default=30, ge=7, le=90)):
             categoria=r.get("CATEGORIA_PROBABLE") or "",
             falla_probable=r.get("FALLA_PROBABLE") or "",
         ))
-        numeros_serie.append((r.get("EQUIPO") or "").strip().upper())
+        if ns:
+            numeros_serie.append(ns)
 
-    # 2. Refacciones históricas de esos equipos
+    if not numeros_serie:
+        return StockPreventivoResponse(
+            fecha_calculo=hoy.isoformat(),
+            horizonte_dias=horizonte_dias,
+            equipos_en_riesgo=len(equipos_en_riesgo),
+            partes_sugeridas=0,
+            partes=[],
+        )
+
+    # 2. Refacciones históricas usando NUMERO_SERIE real
     placeholders = ", ".join(["?" for _ in numeros_serie])
     correctivos_rows = execute_query(f"""
         SELECT NUMERO_SERIE, REFACCIONES
         FROM {S}.CORRECTIVOS
-        WHERE NUMERO_SERIE IN ({placeholders})
+        WHERE UPPER(TRIM(NUMERO_SERIE)) IN ({placeholders})
           AND REFACCIONES IS NOT NULL
           AND TRIM(REFACCIONES) <> ''
           AND UPPER(TRIM(REFACCIONES)) <> 'NINGUNA'
     """, tuple(numeros_serie))
 
-    # 3. Catálogo NUMSPARTE (CATEGORIA_ASOCIADA ya renombrada)
+    # 3. Catálogo NUMSPARTE
     catalogo_rows = execute_query(f"""
         SELECT NO__PARTE, CATEGORIA_ASOCIADA,
                FALLAS_ASOCIADAS__TOP2_, STOCK_MIN_SUGERIDO
