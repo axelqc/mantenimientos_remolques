@@ -1,7 +1,7 @@
 """
 router: refacciones_prevision_final.py
 Previsión de compra de refacciones desde NUMSPARTE.
-Usa execute_query / get_schema de db.py — mismo patrón que main.py
+Usa execute_query / get_schema de db.py
 """
 
 from fastapi import APIRouter, HTTPException, Query
@@ -29,7 +29,6 @@ def get_prioridad(categoria: str, alerta: bool) -> str:
         idx -= 1
     return NIVELES[idx]
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
 class RefaccionPrevision(BaseModel):
     part_number:              str
     categoria:                str
@@ -50,7 +49,6 @@ class PrevisionResponse(BaseModel):
     total_alertas:     int
     refacciones:       list[RefaccionPrevision]
 
-# ─── GET /refacciones/prevision ───────────────────────────────────────────────
 @refacciones_router.get("/prevision", response_model=PrevisionResponse)
 def calcular_prevision(
     horizonte_dias: int = Query(default=30, ge=7, le=180),
@@ -60,13 +58,14 @@ def calcular_prevision(
     S = get_schema()
 
     sql = f"""
-        SELECT NO__PARTE, "Categoría asociada",
-               FALLAS_ASOCIADAS__TOP2_, EQUIPOS_FRECUENTES__TOP3_, USOS_2025, STOCK_MIN_SUGERIDO
+        SELECT NO__PARTE, CATEGORIA_ASOCIADA,
+               FALLAS_ASOCIADAS__TOP2_, EQUIPOS_FRECUENTES__TOP3_,
+               USOS_2025, STOCK_MIN_SUGERIDO
         FROM {S}.NUMSPARTE
     """
     params = ()
     if categoria:
-        sql += ' WHERE UPPER("Categoría asociada") LIKE ?'
+        sql += " WHERE UPPER(CATEGORIA_ASOCIADA) LIKE ?"
         params = (f"%{categoria.upper()}%",)
 
     rows = execute_query(sql, params) if params else execute_query(sql)
@@ -80,8 +79,7 @@ def calcular_prevision(
     for r in rows:
         usos_2025    = int(r.get("USOS_2025") or 0)
         stock_minimo = int(r.get("STOCK_MIN_SUGERIDO") or 0)
-        categoria_r  = r.get("Categoría asociada") or ""
-
+        categoria_r  = r.get("CATEGORIA_ASOCIADA") or ""
         tasa_mensual = round(usos_2025 / 12, 2)
         proyeccion   = round(tasa_mensual * meses_horizonte, 2)
         cantidad_raw = math.ceil(proyeccion)
@@ -116,7 +114,6 @@ def calcular_prevision(
         refacciones=resultado,
     )
 
-# ─── GET /refacciones/alertas-criticas ───────────────────────────────────────
 @refacciones_router.get("/alertas-criticas", response_model=PrevisionResponse)
 def alertas_criticas(horizonte_dias: int = Query(default=30)):
     return calcular_prevision(horizonte_dias=horizonte_dias, solo_alertas=True)
