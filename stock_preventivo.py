@@ -1,70 +1,18 @@
 """
 router: stock_preventivo.py
-Montar en main.py:  app.include_router(stock_router)
-
-Lógica:
-  1. Detectar equipos con falla próxima en 30 días (MEANFTB, riesgo ALTO o MEDIO)
-  2. Buscar en CORRECTIVOS qué refacciones usó cada equipo históricamente
-  3. Cruzar con NUMSPARTE para obtener stock mínimo
-  4. Retornar lista de partes sugeridas con cantidad y contexto de equipos en riesgo
+Stock preventivo cruzando MEANFTB + CORRECTIVOS + NUMSPARTE.
+Usa execute_query / get_schema de db.py — mismo patrón que main.py
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from typing import Optional
-import ibm_db_dbi as db2
 from datetime import date, timedelta
 from collections import defaultdict
-import os
+from db import execute_query, get_schema
 
 stock_router = APIRouter(prefix="/stock", tags=["Stock Preventivo"])
 
-SCHEMA = os.getenv("DB2_SCHEMA", "MSB_LEON")
-
-# ─── Conexión DB2 ─────────────────────────────────────────────────────────────
-def get_db2_conn():
-    conn_str = (
-        f"DATABASE={os.getenv('DB2_DATABASE')};"
-        f"HOSTNAME={os.getenv('DB2_HOST')};"
-        f"PORT={os.getenv('DB2_PORT', '50000')};"
-        f"PROTOCOL=TCPIP;"
-        f"UID={os.getenv('DB2_USER')};"
-        f"PWD={os.getenv('DB2_PASSWORD')};"
-    )
-    conn = db2.connect(conn_str, "", "")
-    try:
-        yield conn
-    finally:
-        conn.close()
-
-# ─── Schemas ──────────────────────────────────────────────────────────────────
-class EquipoEnRiesgo(BaseModel):
-    numero_serie:     str
-    mtbf_dias:        float
-    riesgo:           str
-    fecha_prox_falla: Optional[date]
-    dias_restantes:   int
-    categoria:        str
-    falla_probable:   str
-
-class ParteSugerida(BaseModel):
-    part_number:              str
-    categoria:                str
-    descripcion_falla:        str
-    usos_historicos:          int       # veces que apareció en CORRECTIVOS para estos equipos
-    stock_minimo:             int       # de NUMSPARTE
-    cantidad_sugerida:        int       # max(usos_historicos, stock_minimo)
-    equipos_en_riesgo:        list[EquipoEnRiesgo]
-    prioridad:                str       # CRITICA / ALTA / MEDIA
-
-class StockPreventivoResponse(BaseModel):
-    fecha_calculo:          date
-    horizonte_dias:         int
-    equipos_en_riesgo:      int
-    partes_sugeridas:       int
-    partes:                 list[ParteSugerida]
-
-# ─── Prioridad ────────────────────────────────────────────────────────────────
 PRIORIDAD_CATEGORIA = {
     "ARRANQUE / POTENCIA (BATERÍA / CARGADOR)": "CRITICA",
     "FRENOS":                                   "CRITICA",
@@ -76,167 +24,155 @@ PRIORIDAD_CATEGORIA = {
 
 def get_prioridad(categoria: str, riesgo: str) -> str:
     base = PRIORIDAD_CATEGORIA.get(categoria.strip(), "MEDIA")
-    # Si el equipo es ALTO riesgo y la parte es MEDIA, sube a ALTA
     if riesgo == "ALTO" and base == "MEDIA":
         return "ALTA"
     return base
 
+# ─── Schemas ──────────────────────────────────────────────────────────────────
+class EquipoEnRiesgo(BaseModel):
+    numero_serie:     str
+    mtbf_dias:        float
+    riesgo:           str
+    fecha_prox_falla: Optional[str]
+    dias_restantes:   int
+    categoria:        str
+    falla_probable:   str
+
+class ParteSugerida(BaseModel):
+    part_number:               str
+    categoria:                 str
+    descripcion_falla:         str
+    usos_historicos:           int
+    stock_minimo:              int
+    cantidad_sugerida:         int
+    equipos_en_riesgo:         list[EquipoEnRiesgo]
+    prioridad:                 str
+
+class StockPreventivoResponse(BaseModel):
+    fecha_calculo:     str
+    horizonte_dias:    int
+    equipos_en_riesgo: int
+    partes_sugeridas:  int
+    partes:            list[ParteSugerida]
+
 # ─── GET /stock/preventivo ────────────────────────────────────────────────────
 @stock_router.get("/preventivo", response_model=StockPreventivoResponse)
 def stock_preventivo(
-    horizonte_dias: int = Query(default=30, ge=7, le=90,
-        description="Días a futuro para detectar fallas. Default: 30."),
-    conn=Depends(get_db2_conn),
+    horizonte_dias: int = Query(default=30, ge=7, le=90),
 ):
-    """
-    Genera recomendación de stock preventivo:
-    - Equipos con FECHA_PROX_FALLA en los próximos {horizonte_dias} días
-    - Riesgo ALTO (MTBF < 30d) o MEDIO (MTBF 30-45d)
-    - Refacciones históricamente usadas por esos equipos
-    - Cruzadas con catálogo NUMSPARTE para stock mínimo
-    """
-    cursor = conn.cursor()
-    hoy         = date.today()
-    fecha_limite = hoy + timedelta(days=horizonte_dias)
+    S   = get_schema()
+    hoy = date.today()
+    fecha_limite = (hoy + timedelta(days=horizonte_dias)).isoformat()
 
     # ── 1. Equipos en riesgo desde MEANFTB ────────────────────────────────────
-    cursor.execute(f"""
-        SELECT
-            EQUIPO,
-            MTBF_DIAS,
-            RIESGO,
-            FECHA_PROX_FALLA,
-            CATEGORIA_PROBABLE,
-            FALLA_PROBABLE
-        FROM {SCHEMA}.MEANFTB
+    equipos_rows = execute_query(f"""
+        SELECT EQUIPO, MTBF_DIAS, RIESGO,
+               FECHA_PROX_FALLA, CATEGORIA_PROBABLE, FALLA_PROBABLE
+        FROM {S}.MEANFTB
         WHERE RIESGO IN ('ALTO', 'MEDIO')
           AND FECHA_PROX_FALLA IS NOT NULL
-          AND FECHA_PROX_FALLA <= '{fecha_limite.strftime('%Y-%m-%d')}'
+          AND FECHA_PROX_FALLA <= '{fecha_limite}'
         ORDER BY FECHA_PROX_FALLA ASC
     """)
 
-    equipos_riesgo_rows = cursor.fetchall()
-
-    if not equipos_riesgo_rows:
+    if not equipos_rows:
         return StockPreventivoResponse(
-            fecha_calculo=hoy,
+            fecha_calculo=hoy.isoformat(),
             horizonte_dias=horizonte_dias,
             equipos_en_riesgo=0,
             partes_sugeridas=0,
             partes=[],
         )
 
-    # Construir lista de equipos en riesgo
-    equipos_en_riesgo: list[EquipoEnRiesgo] = []
-    numeros_serie: list[str] = []
+    equipos_en_riesgo = []
+    numeros_serie     = []
 
-    for equipo, mtbf, riesgo, fecha_prox, categoria, falla in equipos_riesgo_rows:
-        dias_restantes = (fecha_prox - hoy).days if fecha_prox else 0
+    for r in equipos_rows:
+        fecha_prox     = r.get("FECHA_PROX_FALLA")
+        fecha_prox_str = fecha_prox[:10] if fecha_prox else None
+        dias_restantes = (date.fromisoformat(fecha_prox_str) - hoy).days if fecha_prox_str else 0
+
         equipos_en_riesgo.append(EquipoEnRiesgo(
-            numero_serie=equipo,
-            mtbf_dias=float(mtbf or 0),
-            riesgo=riesgo or "",
-            fecha_prox_falla=fecha_prox,
+            numero_serie=r["EQUIPO"],
+            mtbf_dias=float(r.get("MTBF_DIAS") or 0),
+            riesgo=r.get("RIESGO") or "",
+            fecha_prox_falla=fecha_prox_str,
             dias_restantes=dias_restantes,
-            categoria=categoria or "",
-            falla_probable=falla or "",
+            categoria=r.get("CATEGORIA_PROBABLE") or "",
+            falla_probable=r.get("FALLA_PROBABLE") or "",
         ))
-        numeros_serie.append(equipo.strip().upper())
+        numeros_serie.append(r["EQUIPO"].strip().upper())
 
-    # ── 2. Historial de CORRECTIVOS para esos equipos ─────────────────────────
-    # Traer todas las refacciones usadas históricamente por estos equipos
+    # ── 2. Historial de refacciones para esos equipos ─────────────────────────
+    # Normalizar en Python — sin UPPER/TRIM en SQL para usar índices
     placeholders = ", ".join(["?" for _ in numeros_serie])
-    cursor.execute(f"""
-        SELECT
-            UPPER(TRIM(NUMERO_SERIE)),
-            REFACCIONES
-        FROM {SCHEMA}.CORRECTIVOS
-        WHERE UPPER(TRIM(NUMERO_SERIE)) IN ({placeholders})
+    correctivos_rows = execute_query(f"""
+        SELECT NUMERO_SERIE, REFACCIONES
+        FROM {S}.CORRECTIVOS
+        WHERE NUMERO_SERIE IN ({placeholders})
           AND REFACCIONES IS NOT NULL
           AND TRIM(REFACCIONES) <> ''
           AND UPPER(TRIM(REFACCIONES)) <> 'NINGUNA'
-    """, numeros_serie)
+    """, tuple(numeros_serie))
 
-    correctivos_rows = cursor.fetchall()
-
-    # ── 3. Catálogo de partes desde NUMSPARTE ─────────────────────────────────
-    cursor.execute(f"""
-        SELECT
-            NO__PARTE,
-            "Categoría asociada",
-            FALLAS_ASOCIADAS__TOP2_,
-            EQUIPOS_FRECUENTES__TOP3_,
-            STOCK_MIN_SUGERIDO
-        FROM {SCHEMA}.NUMSPARTE
+    # ── 3. Catálogo NUMSPARTE ─────────────────────────────────────────────────
+    catalogo_rows = execute_query(f"""
+        SELECT NO__PARTE, "Categoría asociada",
+               FALLAS_ASOCIADAS__TOP2_, STOCK_MIN_SUGERIDO
+        FROM {S}.NUMSPARTE
     """)
-    catalogo_rows = cursor.fetchall()
 
-    # Índice: part_number → datos del catálogo
-    catalogo: dict[str, dict] = {}
-    for part, cat, fallas, equipos_top, stock_min in catalogo_rows:
-        catalogo[part.strip().upper()] = {
-            "categoria":    cat or "",
-            "fallas":       fallas or "",
-            "equipos_top":  equipos_top or "",
-            "stock_minimo": int(stock_min or 0),
+    catalogo = {}
+    for r in catalogo_rows:
+        pn = (r.get("NO__PARTE") or "").strip().upper()
+        catalogo[pn] = {
+            "categoria":    r.get("Categoría asociada") or "",
+            "fallas":       r.get("FALLAS_ASOCIADAS__TOP2_") or "",
+            "stock_minimo": int(r.get("STOCK_MIN_SUGERIDO") or 0),
         }
 
-    all_part_numbers = set(catalogo.keys())
+    all_parts = set(catalogo.keys())
 
-    # ── 4. Detectar part numbers en REFACCIONES (búsqueda en texto) ───────────
-    # Para cada correctivo, buscar qué part numbers del catálogo aparecen en el texto
-    # Estructura: { part_number: { equipo: count } }
+    # ── 4. Detectar part numbers en texto de REFACCIONES ─────────────────────
     uso_por_parte: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for r in correctivos_rows:
+        ns    = (r.get("NUMERO_SERIE") or "").strip().upper()
+        texto = (r.get("REFACCIONES") or "").upper()
+        for pn in all_parts:
+            if pn in texto:
+                uso_por_parte[pn][ns] += 1
 
-    for numero_serie, refacciones_texto in correctivos_rows:
-        texto_upper = refacciones_texto.upper()
-        for part_number in all_part_numbers:
-            if part_number in texto_upper:
-                uso_por_parte[part_number][numero_serie] += 1
+    # ── 5. Construir sugerencias ──────────────────────────────────────────────
+    partes_sugeridas = []
+    ns_set = set(numeros_serie)
 
-    # ── 5. Construir sugerencias por parte ────────────────────────────────────
-    partes_sugeridas: list[ParteSugerida] = []
-
-    for part_number, equipos_uso in uso_por_parte.items():
-        # Solo incluir partes usadas por equipos actualmente en riesgo
-        equipos_en_riesgo_para_parte = [
-            e for e in equipos_en_riesgo
-            if e.numero_serie in equipos_uso
-        ]
-        if not equipos_en_riesgo_para_parte:
+    for pn, equipos_uso in uso_por_parte.items():
+        equipos_parte = [e for e in equipos_en_riesgo if e.numero_serie in equipos_uso]
+        if not equipos_parte:
             continue
 
-        usos_total  = sum(equipos_uso[e.numero_serie] for e in equipos_en_riesgo_para_parte)
-        datos_cat   = catalogo[part_number]
-        stock_min   = datos_cat["stock_minimo"]
+        usos_total  = sum(equipos_uso[e.numero_serie] for e in equipos_parte)
+        datos       = catalogo[pn]
+        stock_min   = datos["stock_minimo"]
         cantidad    = max(usos_total, stock_min)
-        categoria   = datos_cat["categoria"]
-
-        # Riesgo más alto entre los equipos que usan esta parte
-        riesgo_max = "MEDIO"
-        if any(e.riesgo == "ALTO" for e in equipos_en_riesgo_para_parte):
-            riesgo_max = "ALTO"
+        riesgo_max  = "ALTO" if any(e.riesgo == "ALTO" for e in equipos_parte) else "MEDIO"
 
         partes_sugeridas.append(ParteSugerida(
-            part_number=part_number,
-            categoria=categoria,
-            descripcion_falla=datos_cat["fallas"],
+            part_number=pn,
+            categoria=datos["categoria"],
+            descripcion_falla=datos["fallas"],
             usos_historicos=usos_total,
             stock_minimo=stock_min,
             cantidad_sugerida=cantidad,
-            equipos_en_riesgo=equipos_en_riesgo_para_parte,
-            prioridad=get_prioridad(categoria, riesgo_max),
+            equipos_en_riesgo=equipos_parte,
+            prioridad=get_prioridad(datos["categoria"], riesgo_max),
         ))
 
-    # Ordenar: CRITICA → ALTA → MEDIA, luego más usos primero
-    orden_prioridad = {"CRITICA": 0, "ALTA": 1, "MEDIA": 2}
-    partes_sugeridas.sort(key=lambda x: (
-        orden_prioridad.get(x.prioridad, 9),
-        -x.usos_historicos,
-    ))
+    orden = {"CRITICA": 0, "ALTA": 1, "MEDIA": 2}
+    partes_sugeridas.sort(key=lambda x: (orden.get(x.prioridad, 9), -x.usos_historicos))
 
     return StockPreventivoResponse(
-        fecha_calculo=hoy,
+        fecha_calculo=hoy.isoformat(),
         horizonte_dias=horizonte_dias,
         equipos_en_riesgo=len(equipos_en_riesgo),
         partes_sugeridas=len(partes_sugeridas),
