@@ -14,16 +14,19 @@ from db import execute_query, get_schema
 stock_router = APIRouter(prefix="/stock", tags=["Stock Preventivo"])
 
 PRIORIDAD_CATEGORIA = {
-    "ARRANQUE / POTENCIA (BATERÍA / CARGADOR)": "CRITICA",
-    "FRENOS":                                   "CRITICA",
-    "ENFRIAMIENTO / CALENTAMIENTO":             "ALTA",
-    "DIRECCIÓN / EJE":                          "ALTA",
-    "ELÉCTRICO / CONTROLES":                    "MEDIA",
-    "HIDRÁULICO (FUGAS / MANGUERAS / CILINDROS)":"MEDIA",
+    "ARRANQUE / POTENCIA (BATERIA/CARGADOR)": "CRITICA",
+    "FRENOS":                                 "CRITICA",
+    "ENFRIAMIENTO / CALENTAMIENTO":           "ALTA",
+    "DIRECCION / EJE":                        "ALTA",
+    "ELECTRICO / CONTROLES":                  "MEDIA",
+    "HIDRAULICO (FUGAS / MANGUERAS)":         "MEDIA",
 }
 
 def get_prioridad(categoria: str, riesgo: str) -> str:
-    base = PRIORIDAD_CATEGORIA.get(categoria.strip(), "MEDIA")
+    # Normalizar para comparar sin acentos
+    cat = categoria.strip().upper()
+    cat = cat.replace("É","E").replace("Á","A").replace("Í","I").replace("Ó","O").replace("Ú","U")
+    base = PRIORIDAD_CATEGORIA.get(cat, "MEDIA")
     if riesgo == "ALTO" and base == "MEDIA":
         return "ALTA"
     return base
@@ -39,14 +42,14 @@ class EquipoEnRiesgo(BaseModel):
     falla_probable:   str
 
 class ParteSugerida(BaseModel):
-    part_number:               str
-    categoria:                 str
-    descripcion_falla:         str
-    usos_historicos:           int
-    stock_minimo:              int
-    cantidad_sugerida:         int
-    equipos_en_riesgo:         list[EquipoEnRiesgo]
-    prioridad:                 str
+    part_number:       str
+    categoria:         str
+    descripcion_falla: str
+    usos_historicos:   int
+    stock_minimo:      int
+    cantidad_sugerida: int
+    equipos_en_riesgo: list[EquipoEnRiesgo]
+    prioridad:         str
 
 class StockPreventivoResponse(BaseModel):
     fecha_calculo:     str
@@ -60,19 +63,25 @@ class StockPreventivoResponse(BaseModel):
 def stock_preventivo(
     horizonte_dias: int = Query(default=30, ge=7, le=90),
 ):
-    S   = get_schema()
-    hoy = date.today()
+    S    = get_schema()
+    hoy  = date.today()
     fecha_limite = (hoy + timedelta(days=horizonte_dias)).isoformat()
 
     # ── 1. Equipos en riesgo desde MEANFTB ────────────────────────────────────
+    # Aliases limpios para evitar problemas con acentos/paréntesis en las claves del dict
     equipos_rows = execute_query(f"""
-        SELECT EQUIPO, MTBF_DIAS, RIESGO,
-               FECHA_PROX_FALLA, CATEGORIA_PROBABLE, FALLA_PROBABLE
+        SELECT
+            "EQUIPO"                    AS EQUIPO,
+            "MTBF (dias)"              AS MTBF_DIAS,
+            "RIESGO__POR_MTBF_"        AS RIESGO,
+            "Prox falla est. (fecha)"  AS FECHA_PROX_FALLA,
+            "Categoria probable"       AS CATEGORIA,
+            "FALLA_PROBABLE"           AS FALLA_PROBABLE
         FROM {S}.MEANFTB
-        WHERE RIESGO IN ('ALTO', 'MEDIO')
-          AND FECHA_PROX_FALLA IS NOT NULL
-          AND FECHA_PROX_FALLA <= '{fecha_limite}'
-        ORDER BY FECHA_PROX_FALLA ASC
+        WHERE ("RIESGO__POR_MTBF_" LIKE 'ALTO%' OR "RIESGO__POR_MTBF_" LIKE 'MEDIO%')
+          AND "Prox falla est. (fecha)" IS NOT NULL
+          AND "Prox falla est. (fecha)" <= '{fecha_limite}'
+        ORDER BY "Prox falla est. (fecha)" ASC
     """)
 
     if not equipos_rows:
@@ -88,23 +97,24 @@ def stock_preventivo(
     numeros_serie     = []
 
     for r in equipos_rows:
-        fecha_prox     = r.get("FECHA_PROX_FALLA")
+        fecha_prox     = r.get("FECHA_PROX_FALLA") or ""
         fecha_prox_str = fecha_prox[:10] if fecha_prox else None
         dias_restantes = (date.fromisoformat(fecha_prox_str) - hoy).days if fecha_prox_str else 0
+        riesgo_raw     = r.get("RIESGO") or ""
+        riesgo_norm    = "ALTO" if riesgo_raw.upper().startswith("ALTO") else "MEDIO"
 
         equipos_en_riesgo.append(EquipoEnRiesgo(
-            numero_serie=r["EQUIPO"],
+            numero_serie=r.get("EQUIPO") or "",
             mtbf_dias=float(r.get("MTBF_DIAS") or 0),
-            riesgo=r.get("RIESGO") or "",
+            riesgo=riesgo_norm,
             fecha_prox_falla=fecha_prox_str,
             dias_restantes=dias_restantes,
-            categoria=r.get("CATEGORIA_PROBABLE") or "",
+            categoria=r.get("CATEGORIA") or "",
             falla_probable=r.get("FALLA_PROBABLE") or "",
         ))
-        numeros_serie.append(r["EQUIPO"].strip().upper())
+        numeros_serie.append((r.get("EQUIPO") or "").strip().upper())
 
     # ── 2. Historial de refacciones para esos equipos ─────────────────────────
-    # Normalizar en Python — sin UPPER/TRIM en SQL para usar índices
     placeholders = ", ".join(["?" for _ in numeros_serie])
     correctivos_rows = execute_query(f"""
         SELECT NUMERO_SERIE, REFACCIONES
@@ -115,10 +125,13 @@ def stock_preventivo(
           AND UPPER(TRIM(REFACCIONES)) <> 'NINGUNA'
     """, tuple(numeros_serie))
 
-    # ── 3. Catálogo NUMSPARTE ─────────────────────────────────────────────────
+    # ── 3. Catálogo NUMSPARTE (alias para columna con acento) ─────────────────
     catalogo_rows = execute_query(f"""
-        SELECT NO__PARTE, "Categoría asociada",
-               FALLAS_ASOCIADAS__TOP2_, STOCK_MIN_SUGERIDO
+        SELECT
+            NO__PARTE,
+            "Categoria asociada"   AS CATEGORIA,
+            FALLAS_ASOCIADAS__TOP2_,
+            STOCK_MIN_SUGERIDO
         FROM {S}.NUMSPARTE
     """)
 
@@ -126,7 +139,7 @@ def stock_preventivo(
     for r in catalogo_rows:
         pn = (r.get("NO__PARTE") or "").strip().upper()
         catalogo[pn] = {
-            "categoria":    r.get("Categoría asociada") or "",
+            "categoria":    r.get("CATEGORIA") or "",
             "fallas":       r.get("FALLAS_ASOCIADAS__TOP2_") or "",
             "stock_minimo": int(r.get("STOCK_MIN_SUGERIDO") or 0),
         }
@@ -144,18 +157,16 @@ def stock_preventivo(
 
     # ── 5. Construir sugerencias ──────────────────────────────────────────────
     partes_sugeridas = []
-    ns_set = set(numeros_serie)
-
     for pn, equipos_uso in uso_por_parte.items():
         equipos_parte = [e for e in equipos_en_riesgo if e.numero_serie in equipos_uso]
         if not equipos_parte:
             continue
 
-        usos_total  = sum(equipos_uso[e.numero_serie] for e in equipos_parte)
-        datos       = catalogo[pn]
-        stock_min   = datos["stock_minimo"]
-        cantidad    = max(usos_total, stock_min)
-        riesgo_max  = "ALTO" if any(e.riesgo == "ALTO" for e in equipos_parte) else "MEDIO"
+        usos_total = sum(equipos_uso[e.numero_serie] for e in equipos_parte)
+        datos      = catalogo[pn]
+        stock_min  = datos["stock_minimo"]
+        cantidad   = max(usos_total, stock_min)
+        riesgo_max = "ALTO" if any(e.riesgo == "ALTO" for e in equipos_parte) else "MEDIO"
 
         partes_sugeridas.append(ParteSugerida(
             part_number=pn,
