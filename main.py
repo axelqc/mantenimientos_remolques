@@ -15,6 +15,9 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from mtbf import mtbf_router
+from refacciones_prevision_final import refacciones_router
+from stock_preventivo import stock_router
 
 from db import get_db2_connection, execute_query, get_schema
 from plan_predictivo import router as plan_router
@@ -36,7 +39,9 @@ app.add_middleware(
 )
 
 app.include_router(plan_router)
-
+app.include_router(mtbf_router)       # /mtbf/calcular, /mtbf/actualizar-meanftb
+app.include_router(refacciones_router) # /refacciones/prevision, /refacciones/alertas-criticas
+app.include_router(stock_router)       # /stock/preventivo
 
 
 # ============================================================
