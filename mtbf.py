@@ -1,7 +1,7 @@
 """
 router: mtbf.py
 Calcula MTBF dinámico desde CORRECTIVOS y actualiza MEANFTB.
-Usa execute_query / get_schema de db.py — mismo patrón que main.py
+Usa execute_query / get_schema de db.py
 """
 
 from fastapi import APIRouter, Query
@@ -13,7 +13,6 @@ from db import execute_query, get_schema
 
 mtbf_router = APIRouter(prefix="/mtbf", tags=["MTBF / Predictivo"])
 
-# ─── Schemas ──────────────────────────────────────────────────────────────────
 class EquipoMTBF(BaseModel):
     numero_serie:        str
     eventos:             int
@@ -36,7 +35,6 @@ class MTBFResponse(BaseModel):
     equipos_bajo:     int
     equipos:          list[EquipoMTBF]
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 def clasificar_riesgo(mtbf: float) -> str:
     if mtbf < 30:  return "ALTO"
     if mtbf <= 45: return "MEDIO"
@@ -50,7 +48,6 @@ def parse_fecha(val) -> Optional[date]:
         except: return None
     return None
 
-# ─── GET /mtbf/calcular ───────────────────────────────────────────────────────
 @mtbf_router.get("/calcular", response_model=MTBFResponse)
 def calcular_mtbf(
     anio: int = Query(default=2025),
@@ -70,11 +67,11 @@ def calcular_mtbf(
 
     grupos = defaultdict(lambda: {"fechas": [], "categorias": []})
     for r in rows:
-        ns = (r["NUMERO_SERIE"] or "").strip().upper()
-        f  = parse_fecha(r["FECHA_SERVICIO"])
+        ns = (r.get("NUMERO_SERIE") or "").strip().upper()
+        f  = parse_fecha(r.get("FECHA_SERVICIO"))
         if ns and f:
             grupos[ns]["fechas"].append(f)
-            if r["CATEGORIA_FALLA"]:
+            if r.get("CATEGORIA_FALLA"):
                 grupos[ns]["categorias"].append(r["CATEGORIA_FALLA"].strip())
 
     prev_rows = execute_query(f"""
@@ -84,7 +81,7 @@ def calcular_mtbf(
     """)
     uso_map = defaultdict(list)
     for r in prev_rows:
-        ns = (r["NUMERO_SERIE"] or "").strip().upper()
+        ns = (r.get("NUMERO_SERIE") or "").strip().upper()
         uso_map[ns].append(float(r["PROMEDIO_USO_DIA"]))
     promedio_uso = {ns: round(sum(v)/len(v), 2) for ns, v in uso_map.items()}
 
@@ -134,8 +131,6 @@ def calcular_mtbf(
         equipos=resultado,
     )
 
-
-# ─── POST /mtbf/actualizar-meanftb ───────────────────────────────────────────
 @mtbf_router.post("/actualizar-meanftb")
 def actualizar_meanftb(anio: int = Query(default=2025)):
     S = get_schema()
@@ -150,11 +145,11 @@ def actualizar_meanftb(anio: int = Query(default=2025)):
 
     grupos = defaultdict(lambda: {"fechas": [], "categorias": []})
     for r in rows:
-        ns = (r["NUMERO_SERIE"] or "").strip().upper()
-        f  = parse_fecha(r["FECHA_SERVICIO"])
+        ns = (r.get("NUMERO_SERIE") or "").strip().upper()
+        f  = parse_fecha(r.get("FECHA_SERVICIO"))
         if ns and f:
             grupos[ns]["fechas"].append(f)
-            if r["CATEGORIA_FALLA"]:
+            if r.get("CATEGORIA_FALLA"):
                 grupos[ns]["categorias"].append(r["CATEGORIA_FALLA"].strip())
 
     actualizados = insertados = 0
