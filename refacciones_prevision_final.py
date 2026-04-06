@@ -10,6 +10,8 @@ from typing import Optional
 from datetime import date
 from db import execute_query, get_schema
 import math
+from typing import Optional
+from fastapi import Query
 
 refacciones_router = APIRouter(prefix="/refacciones", tags=["Previsión de Refacciones"])
 
@@ -63,12 +65,12 @@ def calcular_prevision(
                USOS_2025, STOCK_MIN_SUGERIDO
         FROM {S}.NUMSPARTE
     """
-    params = ()
+    params = []
     if categoria:
         sql += " WHERE UPPER(CATEGORIA_ASOCIADA) LIKE ?"
-        params = (f"%{categoria.upper()}%",)
-
-    rows = execute_query(sql, params) if params else execute_query(sql)
+        params.append(f"%{categoria.upper()}%")
+    
+    rows = execute_query(sql, params)
 
     if not rows:
         raise HTTPException(status_code=404, detail="No se encontraron refacciones.")
