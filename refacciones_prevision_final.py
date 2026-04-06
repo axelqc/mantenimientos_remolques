@@ -10,8 +10,6 @@ from typing import Optional
 from datetime import date
 from db import execute_query, get_schema
 import math
-from typing import Optional
-from fastapi import Query
 
 refacciones_router = APIRouter(prefix="/refacciones", tags=["Previsión de Refacciones"])
 
@@ -51,12 +49,12 @@ class PrevisionResponse(BaseModel):
     total_alertas:     int
     refacciones:       list[RefaccionPrevision]
 
-@refacciones_router.get("/prevision", response_model=PrevisionResponse)
-def calcular_prevision(
-    horizonte_dias: int = Query(default=30, ge=7, le=180),
-    categoria: Optional[str] = Query(default=None),
-    solo_alertas: bool = Query(default=False),
-):
+
+def _calcular_prevision_logica(
+    horizonte_dias: int,
+    categoria: Optional[str],
+    solo_alertas: bool,
+) -> PrevisionResponse:
     S = get_schema()
 
     sql = f"""
@@ -69,7 +67,7 @@ def calcular_prevision(
     if categoria:
         sql += " WHERE UPPER(CATEGORIA_ASOCIADA) LIKE ?"
         params.append(f"%{categoria.upper()}%")
-    
+
     rows = execute_query(sql, params)
 
     if not rows:
@@ -116,6 +114,16 @@ def calcular_prevision(
         refacciones=resultado,
     )
 
+
+@refacciones_router.get("/prevision", response_model=PrevisionResponse)
+def calcular_prevision(
+    horizonte_dias: int = Query(default=30, ge=7, le=180),
+    categoria: Optional[str] = Query(default=None),
+    solo_alertas: bool = Query(default=False),
+):
+    return _calcular_prevision_logica(horizonte_dias, categoria, solo_alertas)
+
+
 @refacciones_router.get("/alertas-criticas", response_model=PrevisionResponse)
 def alertas_criticas(horizonte_dias: int = Query(default=30)):
-    return calcular_prevision(horizonte_dias=horizonte_dias, solo_alertas=True)
+    return _calcular_prevision_logica(horizonte_dias, categoria=None, solo_alertas=True)
